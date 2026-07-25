@@ -1,0 +1,8 @@
+{
+  "source": ["aws.glue"],
+  "detail-type": ["Glue Job State Change"],
+  "detail": {
+    "jobName": ["xxdea-p4-wistia-ingestion-job", "xxdea-p4-wistia-transformation-job"],
+    "state": ["FAILED", "TIMEOUT", "ERROR"]
+  }
+}

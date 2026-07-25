@@ -23,7 +23,7 @@ Wistia Stats API
 [4] Curated Zone (S3 Delta Lake)
       |
       v
-[5] Glue Data Catalog + Athena                <- not yet implemented
+[5] Glue Data Catalog + Athena                <- implemented in this repo
       |
       v
 [6] Streamlit Dashboard                       <- not yet implemented
@@ -33,9 +33,10 @@ Orchestration: AWS Glue Workflow, daily schedule, run for 7 consecutive days.
 Secrets: AWS Secrets Manager. Monitoring: CloudWatch logs/metrics + SNS
 alerts on job failure. CI/CD: GitHub Actions (lint + test on every push/PR).
 
-This repo currently implements **stages [1] and [3]**, the ingestion and
-transformation jobs. Stages 5–6 are future work tracked against the
-requirement doc's FR list.
+This repo currently implements **stages [1], [3], and [5]** - ingestion,
+transformation, and Athena/Glue Data Catalog - plus scheduling/monitoring
+(FR8: Glue Workflow + SNS/EventBridge alerting). Stage 6 (dashboard) and
+letting the FR8 schedule run for 7 consecutive days are the remaining work.
 
 ## Repo layout
 
@@ -49,9 +50,18 @@ src/wistia_pipeline/
   config.py                    loads config/pipeline_config.yaml (by section)
   transform.py                 PySpark bronze/silver/gold DataFrame logic
 glue_jobs/
-  ingestion_job.py             Glue Python Shell job entrypoint (stage 1)
-  transformation_job.py        Glue PySpark job entrypoint (stage 3)
+  ingestion_job.py                    Glue Python Shell job entrypoint (stage 1)
+  ingestion_job_standalone.py         single-file deployment copy for the Glue Script tab
+  transformation_job.py               Glue PySpark job entrypoint (stage 3)
+  transformation_job_standalone.py    single-file deployment copy for the Glue Script tab
 tests/                        pytest unit tests (moto for AWS, responses for HTTP, local Spark for transform)
+infra/aws/
+  github-oidc-trust-policy.json       IAM trust policy for GitHub Actions OIDC
+  ecr-push-permissions-policy.json    IAM permissions policy for ECR push
+  athena_ddl.sql                      registers the gold Delta tables in Athena/Glue Data Catalog
+  eventbridge-glue-failure-rule.json  EventBridge pattern: Glue job failure -> SNS
+  sns-topic-policy.json               reference SNS topic policy for CLI-created rules
+docs/production-run-log.md    FR8 7-consecutive-day run tracking template
 ```
 
 ## Wistia API token handling
@@ -124,18 +134,103 @@ python glue_jobs/transformation_job.py \
 ### Running as a Glue job
 
 Create a **Spark** job (not Python Shell), Glue version **5.0** (Spark 3.5 +
-Delta Lake 3.x). Upload `glue_jobs/transformation_job.py` plus the
-`src/wistia_pipeline` package the same way as the ingestion job. Under Job
-details, set:
+Delta Lake 3.x). Easiest path: paste `glue_jobs/transformation_job_standalone.py`
+directly into the Glue Studio Script tab (all logic inlined, same rationale
+as `ingestion_job_standalone.py` - no `--extra-py-files` zip to get wrong).
+The modular `glue_jobs/transformation_job.py` + `src/wistia_pipeline` package
+remains the source of truth for local dev/tests; keep both in sync.
 
-- `--datalake-formats` = `delta`
+Under Job details, set:
+
+- `--datalake-formats` = `delta` — makes the Delta Lake JARs available, but
+  does **not** by itself configure the Spark session for Delta, so also set:
+- `--conf` = `spark.sql.extensions=io.delta.sql.DeltaSparkSessionExtension --conf spark.sql.catalog.spark_catalog=org.apache.spark.sql.delta.catalog.DeltaCatalog`
+  (yes, a second `--conf` inline in that value — this is the documented way
+  to pass multiple Spark configs through one Glue job parameter). Omitting
+  this causes `DELTA_CONFIGURE_SPARK_SESSION_WITH_EXTENSION_AND_CATALOG`.
 - Job parameters: `--raw-bucket`, `--curated-bucket` (required); optionally
   `--raw-prefix`, `--curated-prefix`, `--default-channel`, and
-  `--channel-mapping-json` (a JSON string like `{"8hunphufxp":"YouTube"}`,
-  overriding `config/pipeline_config.yaml`'s `transformation.channel_mapping`).
+  `--channel-mapping-json` (a JSON string like `{"8hunphufxp":"YouTube"}`).
 
 Attach an IAM role with `s3:GetObject` on the raw bucket and
-`s3:GetObject`/`s3:PutObject`/`s3:DeleteObject` on the curated bucket.
+`s3:GetObject`/`s3:PutObject`/`s3:DeleteObject` on the curated bucket (the
+same role used for the ingestion job works if it already covers this bucket
+- just confirm it also allows writes to the curated prefix, not only the
+raw/checkpoint prefixes).
+
+## Glue Data Catalog + Athena
+
+`infra/aws/athena_ddl.sql` registers the gold Delta tables in the Glue Data
+Catalog so they're queryable from Athena. No crawler is needed - Athena
+engine v3 reads Delta table schema directly from `_delta_log`, so a plain
+`CREATE EXTERNAL TABLE ... TBLPROPERTIES ('table_type' = 'DELTA')` pointing
+at each table's S3 location is enough.
+
+1. Open the Athena console, confirm the workgroup's query result location is
+   set (Settings → Manage), e.g. `s3://<bucket>/athena-results/`.
+2. Run `infra/aws/athena_ddl.sql` in the query editor - it creates the
+   `wistia_video_analytics` database and `dim_media`, `dim_visitor`,
+   `fact_media_engagement` tables, plus a few sanity-check/example queries.
+3. The IAM identity running the queries needs `glue:CreateDatabase`/
+   `glue:CreateTable`/`glue:Get*`, `s3:GetObject`/`s3:ListBucket` on the
+   curated bucket, and `s3:PutObject` on the query-results bucket.
+
+## Scheduling & monitoring (FR8)
+
+A Glue Workflow chains ingestion → transformation on a daily schedule;
+CloudWatch/EventBridge + SNS alert on job failure. All AWS-native, no
+external orchestrator.
+
+### 1. SNS topic for failure alerts
+
+1. SNS console → Topics → **Create topic** → Standard → name
+   `wistia-pipeline-alerts` → Create.
+2. **Create subscription** → Protocol `Email` → Endpoint your alert address
+   → Create subscription.
+3. Check that inbox and click the confirmation link — SNS delivers nothing
+   until the subscription is confirmed.
+
+### 2. EventBridge rule: Glue job failure → SNS
+
+Glue emits an EventBridge event (`aws.glue` / `Glue Job State Change`) on
+every state transition, so this catches failures without polling.
+
+1. EventBridge console → Rules → **Create rule** → name
+   `wistia-glue-job-failure-alerts`, event bus `default`, rule type
+   "Rule with an event pattern".
+2. Event pattern → **Custom pattern (JSON editor)** → paste
+   `infra/aws/eventbridge-glue-failure-rule.json` (lists both job names,
+   states `FAILED`/`TIMEOUT`/`ERROR`).
+3. Target → **SNS topic** → `wistia-pipeline-alerts`. The console adds the
+   required resource policy on the topic automatically (that's what
+   `infra/aws/sns-topic-policy.json` documents, for reference/CLI use only
+   — skip it if you created the rule through the console).
+4. Create rule.
+
+### 3. Glue Workflow: daily schedule, ingestion → transformation
+
+1. Glue console → Workflows → **Add workflow** → name
+   `wistia-video-analytics-workflow` → Create.
+2. Open it → **Add trigger** → New:
+   - Name `daily-schedule-trigger`, type **Schedule**, frequency Custom,
+     e.g. `cron(0 6 * * ? *)` (6 AM UTC daily — adjust to taste), activate
+     on creation.
+   - Actions → Add job → `xxdea-p4-wistia-ingestion-job` → Add.
+3. **Add trigger** → New again:
+   - Name `transformation-after-ingestion-trigger`, type **Event**
+     (conditional), "Start after ALL watched jobs/crawlers succeed",
+     watching `xxdea-p4-wistia-ingestion-job` for state `SUCCEEDED`,
+     activate on creation.
+   - Actions → Add job → `xxdea-p4-wistia-transformation-job` → Add.
+4. Save the workflow, then **Run** it once manually to confirm both jobs
+   fire in sequence and succeed before waiting on the schedule.
+
+### 4. Tracking the 7 consecutive days
+
+Glue console → Workflows → `wistia-video-analytics-workflow` → **History**
+tab lists every run with per-job status. Use `docs/production-run-log.md`
+to log one row per day as evidence for FR8/FR12 in the final submission —
+a screenshot of 7 consecutive `SUCCEEDED` runs is the clearest artifact.
 
 ## CI/CD: build & push to ECR
 
@@ -257,4 +352,6 @@ network calls or real credentials are needed to run the suite.
 | FR7 Incremental ingestion | Done — checkpoint-based, see above |
 | FR9 CI/CD | Done — `.github/workflows/ci.yml` runs lint + tests |
 | FR10 Transform to dim/fact model | Done — `glue_jobs/transformation_job.py`, see above |
-| FR1, FR8, FR11–FR12 | Pending — architecture doc, 7-day production run, Athena/dashboard, final submission |
+| FR11 Data Catalog + SQL querying | Done — `infra/aws/athena_ddl.sql`, see above |
+| FR8 7-day production run | Instrumented — Glue Workflow schedule + SNS/EventBridge alerting set up, see above; pending 7 consecutive daily runs (`docs/production-run-log.md`) |
+| FR1, FR12 | Pending — architecture doc, dashboard, final submission |
