@@ -1,0 +1,16 @@
+# Non-secret defaults for local development and Glue job parameter fallback.
+# Never put the Wistia API token in this file - it is retrieved from AWS
+# Secrets Manager (see src/wistia_pipeline/secrets.py) or, for local dev
+# only, from the WISTIA_API_TOKEN environment variable.
+ingestion:
+  media_ids:
+    - 8hunphufxp
+    - 9k4tbcdfg0
+  raw_bucket: wistia-video-analytics-raw
+  raw_prefix: wistia-video-analytics/raw
+  checkpoint_bucket: wistia-video-analytics-raw
+  checkpoint_key: wistia-video-analytics/raw/_checkpoint/checkpoint.json
+  secret_name: wistia/api-token
+  aws_region: us-east-1
+  events_per_page: 100
+  max_event_pages: 50
