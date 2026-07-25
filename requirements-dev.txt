@@ -7,3 +7,5 @@ ruff>=0.5,<1
 # Spark/Delta at runtime via Glue version 5.0 + --datalake-formats delta).
 pyspark==3.5.4
 delta-spark==3.2.1
+# For the Streamlit dashboard (local runs + tests only).
+-r requirements-dashboard.txt

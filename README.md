@@ -26,17 +26,18 @@ Wistia Stats API
 [5] Glue Data Catalog + Athena                <- implemented in this repo
       |
       v
-[6] Streamlit Dashboard                       <- not yet implemented
+[6] Streamlit Dashboard                       <- implemented in this repo
 ```
 
 Orchestration: AWS Glue Workflow, daily schedule, run for 7 consecutive days.
 Secrets: AWS Secrets Manager. Monitoring: CloudWatch logs/metrics + SNS
 alerts on job failure. CI/CD: GitHub Actions (lint + test on every push/PR).
 
-This repo currently implements **stages [1], [3], and [5]** - ingestion,
-transformation, and Athena/Glue Data Catalog - plus scheduling/monitoring
-(FR8: Glue Workflow + SNS/EventBridge alerting). Stage 6 (dashboard) and
-letting the FR8 schedule run for 7 consecutive days are the remaining work.
+This repo now implements **all six architecture stages** - ingestion,
+transformation, Athena/Glue Data Catalog, the Streamlit dashboard, and
+scheduling/monitoring (FR8: Glue Workflow + SNS/EventBridge alerting). The
+only remaining work is letting the FR8 schedule run for 7 consecutive days
+and the final submission writeup (FR1/FR12).
 
 ## Repo layout
 
@@ -62,6 +63,10 @@ infra/aws/
   eventbridge-glue-failure-rule.json  EventBridge pattern: Glue job failure -> SNS
   sns-topic-policy.json               reference SNS topic policy for CLI-created rules
 docs/production-run-log.md    FR8 7-consecutive-day run tracking template
+dashboard/
+  app.py                       Streamlit app (architecture stage 6)
+  queries.py                   Athena query helpers used by the dashboard
+requirements-dashboard.txt    dashboard-only deps (streamlit, awswrangler, pandas, plotly)
 ```
 
 ## Wistia API token handling
@@ -232,6 +237,42 @@ tab lists every run with per-job status. Use `docs/production-run-log.md`
 to log one row per day as evidence for FR8/FR12 in the final submission —
 a screenshot of 7 consecutive `SUCCEEDED` runs is the clearest artifact.
 
+## Streamlit dashboard
+
+`dashboard/app.py` (queries in `dashboard/queries.py`) is architecture
+stage 6. It reads the gold model **through Athena** (via `awswrangler`),
+not Spark/Delta directly, so the dashboard has no Spark dependency and
+stays in sync with whatever `infra/aws/athena_ddl.sql` registered.
+
+Panels: KPI row (total plays, watch hours, unique visitors, avg. watched%),
+plays-by-media bar chart (colored by channel), daily plays trend, visitors
+by country, and a detail table.
+
+### Running locally
+
+```bash
+pip install -r requirements-dashboard.txt
+export AWS_PROFILE=your-profile   # needs Athena/Glue/S3 read + query-results write, see below
+streamlit run dashboard/app.py
+```
+
+Optional env vars: `WISTIA_DASHBOARD_DATABASE` (default
+`wistia_video_analytics`), `ATHENA_WORKGROUP` (default `primary`),
+`ATHENA_S3_OUTPUT` (only needed if the workgroup has no default query
+result location configured).
+
+The AWS identity running it needs the same permissions as an Athena user
+querying these tables: `athena:StartQueryExecution`/`GetQueryExecution`/
+`GetQueryResults`, `glue:GetTable`/`GetDatabase`/`GetPartitions`,
+`s3:GetObject`/`ListBucket` on the curated bucket, and
+`s3:GetObject`/`PutObject` on the Athena query-results bucket.
+
+I can't verify the rendered charts against real numbers in this sandbox
+(no AWS credentials here) — run it and confirm the KPIs/charts populate
+with your actual data; `tests/test_dashboard_queries.py` mocks the Athena
+call to check each query targets the right tables, but that's wiring
+coverage, not a substitute for eyeballing the real dashboard.
+
 ## CI/CD: build & push to ECR
 
 `.github/workflows/ci.yml` has two jobs: `lint-and-test` (always) and
@@ -354,4 +395,5 @@ network calls or real credentials are needed to run the suite.
 | FR10 Transform to dim/fact model | Done — `glue_jobs/transformation_job.py`, see above |
 | FR11 Data Catalog + SQL querying | Done — `infra/aws/athena_ddl.sql`, see above |
 | FR8 7-day production run | Instrumented — Glue Workflow schedule + SNS/EventBridge alerting set up, see above; pending 7 consecutive daily runs (`docs/production-run-log.md`) |
-| FR1, FR12 | Pending — architecture doc, dashboard, final submission |
+| FR (dashboard/visualization) | Done — `dashboard/app.py`, see above; needs a live run against real Athena data to confirm rendering |
+| FR1, FR12 | Pending — architecture doc, final submission |
