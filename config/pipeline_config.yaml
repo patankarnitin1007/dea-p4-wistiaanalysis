@@ -14,3 +14,15 @@ ingestion:
   aws_region: us-east-1
   events_per_page: 100
   max_event_pages: 50
+
+transformation:
+  raw_bucket: wistia-video-analytics-raw
+  raw_prefix: wistia-video-analytics/raw
+  curated_bucket: wistia-video-analytics-raw
+  curated_prefix: wistia-video-analytics/curated
+  # Wistia's media/stats API has no "channel" (e.g. YouTube/Facebook) field -
+  # it isn't part of the media object, only project/share_link. Populate this
+  # mapping by hand per media_id if that dimension matters for reporting;
+  # anything not listed here falls back to default_channel.
+  default_channel: Unknown
+  channel_mapping: {}

@@ -17,7 +17,7 @@ Wistia Stats API
 [2] Raw Zone (S3, load_date= partitions)
       |
       v
-[3] Transformation Job (Glue PySpark)         <- not yet implemented
+[3] Transformation Job (Glue PySpark)         <- implemented in this repo
       |  Bronze / Silver / Gold (Delta)
       v
 [4] Curated Zone (S3 Delta Lake)
@@ -33,21 +33,25 @@ Orchestration: AWS Glue Workflow, daily schedule, run for 7 consecutive days.
 Secrets: AWS Secrets Manager. Monitoring: CloudWatch logs/metrics + SNS
 alerts on job failure. CI/CD: GitHub Actions (lint + test on every push/PR).
 
-This repo currently implements **stage [1], the ingestion job**. Stages
-2–6 are future work tracked against the requirement doc's FR list.
+This repo currently implements **stages [1] and [3]**, the ingestion and
+transformation jobs. Stages 5–6 are future work tracked against the
+requirement doc's FR list.
 
 ## Repo layout
 
 ```
-config/pipeline_config.yaml   non-secret defaults (bucket names, media ids, ...)
+config/pipeline_config.yaml   non-secret defaults (bucket names, media ids, channel mapping, ...)
 src/wistia_pipeline/
   wistia_client.py            Wistia Data/Stats API client (pagination, retries)
   checkpoint.py                S3-backed checkpoint.json read/write
   s3_writer.py                 writes raw JSON to the S3 raw zone
   secrets.py                   resolves the Wistia API token (Secrets Manager or env var)
-  config.py                    loads config/pipeline_config.yaml
-glue_jobs/ingestion_job.py    Glue Python Shell job entrypoint
-tests/                        pytest unit tests (moto for AWS, responses for HTTP)
+  config.py                    loads config/pipeline_config.yaml (by section)
+  transform.py                 PySpark bronze/silver/gold DataFrame logic
+glue_jobs/
+  ingestion_job.py             Glue Python Shell job entrypoint (stage 1)
+  transformation_job.py        Glue PySpark job entrypoint (stage 3)
+tests/                        pytest unit tests (moto for AWS, responses for HTTP, local Spark for transform)
 ```
 
 ## Wistia API token handling
@@ -87,6 +91,51 @@ as the Glue Python Shell script/library, and configure Job Parameters
 matching the CLI flags above (e.g. `--raw-bucket`, `--secret-name`). Attach
 an IAM role with `s3:GetObject`/`s3:PutObject` on the raw bucket and
 `secretsmanager:GetSecretValue` on the token secret.
+
+## Transformation job (Bronze / Silver / Gold)
+
+`glue_jobs/transformation_job.py` (logic in `src/wistia_pipeline/transform.py`)
+reads the raw zone written by the ingestion job and produces Delta tables in
+a curated S3 zone:
+
+- **Bronze** (`bronze/media_stats`, `bronze/visitor_events`): raw JSON parsed
+  against an explicit schema, one row per source record, no cleaning.
+- **Silver** (`silver/media_stats`, `silver/visitor_events`): typed/flattened,
+  visitor events deduplicated by `event_key`, a `date` column added.
+- **Gold**, matching the FR10 model:
+  - `dim_media` (media_id, title, url, channel, created_at) — latest
+    metadata snapshot per media_id.
+  - `dim_visitor` (visitor_id, ip_address, country) — latest known
+    ip/country per visitor_key.
+  - `fact_media_engagement` (media_id, visitor_id, date, play_count,
+    play_rate, total_watch_time, watched_percent), partitioned by `date`.
+    Grain is one row per media/visitor/day; see assumptions below for how
+    each metric is derived.
+
+### Running locally
+
+```bash
+pip install -r requirements-dev.txt   # includes pyspark + delta-spark
+python glue_jobs/transformation_job.py \
+  --raw-bucket my-raw-bucket \
+  --curated-bucket my-raw-bucket
+```
+
+### Running as a Glue job
+
+Create a **Spark** job (not Python Shell), Glue version **5.0** (Spark 3.5 +
+Delta Lake 3.x). Upload `glue_jobs/transformation_job.py` plus the
+`src/wistia_pipeline` package the same way as the ingestion job. Under Job
+details, set:
+
+- `--datalake-formats` = `delta`
+- Job parameters: `--raw-bucket`, `--curated-bucket` (required); optionally
+  `--raw-prefix`, `--curated-prefix`, `--default-channel`, and
+  `--channel-mapping-json` (a JSON string like `{"8hunphufxp":"YouTube"}`,
+  overriding `config/pipeline_config.yaml`'s `transformation.channel_mapping`).
+
+Attach an IAM role with `s3:GetObject` on the raw bucket and
+`s3:GetObject`/`s3:PutObject`/`s3:DeleteObject` on the curated bucket.
 
 ## CI/CD: build & push to ECR
 
@@ -166,7 +215,35 @@ network calls or real credentials are needed to run the suite.
   `5xx` with exponential backoff (honoring `Retry-After` when present);
   `401`/`404` fail fast since retrying won't help.
 - **No DBT / no non-AWS services**, per the technical constraints — Python
-  for ingestion, PySpark for transformation (stage 3, not yet built).
+  for ingestion, PySpark for transformation.
+- **No native "channel" field:** Wistia's media object exposes `project`
+  and `share_link`, but nothing identifying a distribution channel (e.g.
+  YouTube/Facebook). `dim_media.channel` is resolved from a
+  `media_id -> channel` mapping in `config/pipeline_config.yaml`
+  (`transformation.channel_mapping`), defaulting to `"Unknown"` for any
+  media_id not listed — update that mapping by hand as media are added.
+- **`fact_media_engagement` grain and metrics** (one row per
+  media_id/visitor_id/date):
+  - `play_count` = number of visitor events for that media/visitor/day
+    (each event is treated as one playback session).
+  - `watched_percent` = the furthest point reached that day
+    (`max(percent_viewed)` across that day's events).
+  - `total_watch_time` = `sum(percent_viewed * media.duration)` across that
+    day's events — an approximation of seconds watched, since Wistia's
+    events API reports `percent_viewed` per event, not raw watch seconds.
+  - `play_rate` = the media-level `stats.play_rate` from the latest
+    ingested snapshot, denormalized onto every row for that media_id —
+    Wistia doesn't expose play_rate broken out by visitor or day.
+- **Latest-snapshot dimensions:** `dim_media` and `dim_visitor` take the
+  most recent ingested snapshot per key (media's `updated` timestamp;
+  visitor's most recent event) rather than tracking full history
+  (no SCD2) — acceptable since the requirement doc's model is a plain
+  star schema, not a history-tracking one.
+- **Idempotent writes:** each transformation run overwrites the bronze/
+  silver/gold Delta tables from the full raw zone rather than appending,
+  so reruns are safe and there's no double-counting from re-running a
+  failed job. This trades incremental-transform efficiency for simplicity;
+  revisit if the raw zone grows large enough for a full rebuild to be slow.
 
 ## Requirement traceability
 
@@ -179,4 +256,5 @@ network calls or real credentials are needed to run the suite.
 | FR6 Pagination | Done — `iter_media_events` pages until a short page |
 | FR7 Incremental ingestion | Done — checkpoint-based, see above |
 | FR9 CI/CD | Done — `.github/workflows/ci.yml` runs lint + tests |
-| FR1, FR8, FR10–FR12 | Pending — architecture doc, 7-day production run, transformation/DWH, dashboard, final submission |
+| FR10 Transform to dim/fact model | Done — `glue_jobs/transformation_job.py`, see above |
+| FR1, FR8, FR11–FR12 | Pending — architecture doc, 7-day production run, Athena/dashboard, final submission |

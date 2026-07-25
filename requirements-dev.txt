@@ -3,3 +3,7 @@ pytest>=8.0,<9
 responses>=0.25,<1
 moto[s3,secretsmanager]>=5.0,<6
 ruff>=0.5,<1
+# For the transformation job (local runs + tests only - Glue provides
+# Spark/Delta at runtime via Glue version 5.0 + --datalake-formats delta).
+pyspark==3.5.4
+delta-spark==3.2.1
