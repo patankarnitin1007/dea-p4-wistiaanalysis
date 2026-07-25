@@ -1,209 +1,43 @@
 """AWS Glue Python Shell job: ingests Wistia media + visitor stats to the S3 raw zone.
 
-Standalone, single-file version of glue_jobs/ingestion_job.py with the
-wistia_pipeline package inlined, for pasting directly into the Glue Studio
-Script tab so no separate "Python library path" zip is needed. The
-modular version (glue_jobs/ingestion_job.py + src/wistia_pipeline/) remains
-the source of truth for local development, tests, and CI/CD to ECR - keep
-both in sync if you change the ingestion logic.
-
-Required Job parameters (Job details tab, one per line, "--name" / value):
-  --media-ids            comma-separated Wistia hashed media IDs, e.g. 8hunphufxp,9k4tbcdfg0
-  --raw-bucket           S3 bucket for the raw zone
-  --checkpoint-bucket    S3 bucket for checkpoint.json (can be the same bucket)
-Optional (sensible defaults below if omitted):
-  --raw-prefix, --checkpoint-key, --secret-name, --aws-region,
-  --events-per-page, --max-event-pages, --load-date
-Also set under Job details:
-  --additional-python-modules = requests==2.31.0
-(boto3 ships with the Glue Python Shell runtime already.)
+Runs as a plain Python script so it works both as a Glue Python Shell job
+(job parameters become --arg-name values configured in Glue) and locally /
+in CI for testing. Defaults for non-secret settings come from
+config/pipeline_config.yaml; any value can be overridden via CLI args.
 """
 import argparse
 import datetime as dt
-import json
 import logging
 import sys
-import time
+from pathlib import Path
 
-import boto3
-import requests
-from botocore.exceptions import ClientError
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+from wistia_pipeline.checkpoint import CheckpointStore
+from wistia_pipeline.config import load_yaml_defaults
+from wistia_pipeline.s3_writer import RawJsonWriter
+from wistia_pipeline.secrets import get_wistia_api_token
+from wistia_pipeline.wistia_client import WistiaAPIError, WistiaClient
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("wistia_ingestion_job")
 
-# --- wistia_pipeline.secrets -------------------------------------------------
-
-ENV_TOKEN_VAR = "WISTIA_API_TOKEN"
-DEFAULT_SECRET_KEY = "api_token"
-
-
-def get_wistia_api_token(secret_name=None, secret_key=DEFAULT_SECRET_KEY, region_name=None, secrets_client=None):
-    import os
-
-    env_token = os.environ.get(ENV_TOKEN_VAR)
-    if env_token:
-        logger.info("Using Wistia API token from %s environment variable", ENV_TOKEN_VAR)
-        return env_token
-
-    if not secret_name:
-        raise RuntimeError(
-            f"No Wistia API token available: set {ENV_TOKEN_VAR} or pass --secret-name "
-            "pointing at an AWS Secrets Manager secret"
-        )
-
-    client = secrets_client or boto3.client("secretsmanager", region_name=region_name)
-    response = client.get_secret_value(SecretId=secret_name)
-    secret_string = response["SecretString"]
-    try:
-        return json.loads(secret_string)[secret_key]
-    except (json.JSONDecodeError, KeyError):
-        # Secret was stored as a plain string rather than a {"api_token": ...} blob.
-        return secret_string
-
-
-# --- wistia_pipeline.wistia_client -------------------------------------------
-
-WISTIA_API_BASE = "https://api.wistia.com/v1"
-RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
-
-
-class WistiaAPIError(Exception):
-    """Raised for any non-recoverable failure calling the Wistia API."""
-
-
-class WistiaClient:
-    def __init__(self, api_token, base_url=WISTIA_API_BASE, timeout=30, max_retries=5, backoff_factor=2.0):
-        self._session = requests.Session()
-        self._session.headers.update({"Authorization": f"Bearer {api_token}"})
-        self._base_url = base_url.rstrip("/")
-        self._timeout = timeout
-        self._max_retries = max_retries
-        self._backoff_factor = backoff_factor
-
-    def get_media(self, media_id):
-        """Media metadata: title, hashed_id, created, updated, duration, etc."""
-        return self._get(f"medias/{media_id}.json")
-
-    def get_media_stats(self, media_id):
-        """Media-level engagement stats: play_count, play_rate, hours_watched, etc."""
-        return self._get(f"stats/medias/{media_id}.json")
-
-    def iter_media_events(self, media_id, per_page=100, max_pages=50):
-        """Yields visitor-level play events for a media, one dict per event."""
-        page = 1
-        while page <= max_pages:
-            batch = self._get(
-                "stats/events.json",
-                params={"media_id": media_id, "page": page, "per_page": per_page},
-            )
-            if not batch:
-                return
-            yield from batch
-            if len(batch) < per_page:
-                return
-            page += 1
-        logger.warning(
-            "Reached max_pages=%d fetching events for media_id=%s; there may be more pages",
-            max_pages,
-            media_id,
-        )
-
-    def _get(self, path, params=None):
-        url = f"{self._base_url}/{path.lstrip('/')}"
-        attempt = 0
-        while True:
-            attempt += 1
-            try:
-                response = self._session.get(url, params=params, timeout=self._timeout)
-            except requests.RequestException as exc:
-                if attempt > self._max_retries:
-                    raise WistiaAPIError(f"Request to {url} failed after {attempt} attempts: {exc}") from exc
-                self._sleep_before_retry(attempt)
-                continue
-
-            if response.status_code == 200:
-                return response.json()
-            if response.status_code == 401:
-                raise WistiaAPIError(f"Unauthorized calling {url}: check the Wistia API token permissions")
-            if response.status_code == 404:
-                raise WistiaAPIError(f"Not found calling {url} with params={params}")
-            if response.status_code in RETRYABLE_STATUS_CODES:
-                if attempt > self._max_retries:
-                    raise WistiaAPIError(
-                        f"{url} failed with status {response.status_code} after {attempt} attempts: {response.text}"
-                    )
-                self._sleep_before_retry(attempt, retry_after=response.headers.get("Retry-After"))
-                continue
-            raise WistiaAPIError(f"Unexpected status {response.status_code} calling {url}: {response.text}")
-
-    def _sleep_before_retry(self, attempt, retry_after=None):
-        delay = float(retry_after) if retry_after else self._backoff_factor**attempt
-        logger.warning("Retrying request in %.1fs (attempt %d/%d)", delay, attempt, self._max_retries)
-        time.sleep(delay)
-
-
-# --- wistia_pipeline.checkpoint -----------------------------------------------
-
-
-class CheckpointStore:
-    def __init__(self, bucket, key, s3_client=None):
-        self._bucket = bucket
-        self._key = key
-        self._s3 = s3_client or boto3.client("s3")
-
-    def load(self):
-        try:
-            obj = self._s3.get_object(Bucket=self._bucket, Key=self._key)
-            return json.loads(obj["Body"].read())
-        except ClientError as exc:
-            error_code = exc.response.get("Error", {}).get("Code")
-            if error_code in ("NoSuchKey", "404"):
-                logger.info("No checkpoint found at s3://%s/%s, starting from scratch", self._bucket, self._key)
-                return {}
-            raise
-
-    def save(self, checkpoint):
-        self._s3.put_object(
-            Bucket=self._bucket,
-            Key=self._key,
-            Body=json.dumps(checkpoint, indent=2, default=str).encode("utf-8"),
-            ContentType="application/json",
-        )
-        logger.info("Saved checkpoint to s3://%s/%s", self._bucket, self._key)
-
-
-# --- wistia_pipeline.s3_writer -------------------------------------------------
-
-
-class RawJsonWriter:
-    def __init__(self, bucket, prefix, s3_client=None):
-        self._bucket = bucket
-        self._prefix = prefix.strip("/")
-        self._s3 = s3_client or boto3.client("s3")
-
-    def write(self, dataset, load_date, file_name, payload):
-        key = f"{self._prefix}/{dataset}/load_date={load_date}/{file_name}"
-        body = json.dumps(payload, default=str).encode("utf-8")
-        self._s3.put_object(Bucket=self._bucket, Key=key, Body=body, ContentType="application/json")
-        logger.info("Wrote %d bytes to s3://%s/%s", len(body), self._bucket, key)
-        return key
-
-
-# --- job entrypoint (was glue_jobs/ingestion_job.py) ---------------------------
-
 
 def parse_args(argv=None):
+    defaults = load_yaml_defaults()
     parser = argparse.ArgumentParser(description="Wistia Stats API ingestion job")
-    parser.add_argument("--media-ids", default="")
-    parser.add_argument("--raw-bucket", default=None)
-    parser.add_argument("--raw-prefix", default="wistia-video-analytics/raw")
-    parser.add_argument("--checkpoint-bucket", default=None)
-    parser.add_argument("--checkpoint-key", default="wistia-video-analytics/raw/_checkpoint/checkpoint.json")
-    parser.add_argument("--secret-name", default="wistia/api-token")
-    parser.add_argument("--aws-region", default=None)
-    parser.add_argument("--events-per-page", type=int, default=100)
-    parser.add_argument("--max-event-pages", type=int, default=50)
+    parser.add_argument("--media-ids", default=",".join(defaults.get("media_ids", [])))
+    parser.add_argument("--raw-bucket", default=defaults.get("raw_bucket"))
+    parser.add_argument("--raw-prefix", default=defaults.get("raw_prefix", "wistia-video-analytics/raw"))
+    parser.add_argument("--checkpoint-bucket", default=defaults.get("checkpoint_bucket"))
+    parser.add_argument(
+        "--checkpoint-key",
+        default=defaults.get("checkpoint_key", "wistia-video-analytics/raw/_checkpoint/checkpoint.json"),
+    )
+    parser.add_argument("--secret-name", default=defaults.get("secret_name"))
+    parser.add_argument("--aws-region", default=defaults.get("aws_region"))
+    parser.add_argument("--events-per-page", type=int, default=defaults.get("events_per_page", 100))
+    parser.add_argument("--max-event-pages", type=int, default=defaults.get("max_event_pages", 50))
     parser.add_argument("--load-date", default=None, help="Override load_date partition, defaults to today (UTC)")
     # Glue's Python Shell runner always injects its own arguments (--JOB_NAME,
     # --TempDir, --enable-glue-datacatalog, --library-set, ...) whether or not
