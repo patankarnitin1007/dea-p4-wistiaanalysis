@@ -17,7 +17,13 @@ S3_OUTPUT = os.environ.get("ATHENA_S3_OUTPUT")  # optional; falls back to the wo
 
 @st.cache_data(ttl=300, show_spinner="Querying Athena...")
 def run_query(sql: str) -> pd.DataFrame:
-    return wr.athena.read_sql_query(sql, database=DATABASE, workgroup=WORKGROUP, s3_output=S3_OUTPUT)
+    # ctas_approach=False: the default CTAS approach creates a temporary Glue
+    # table to stage results and drops it afterward, which needs
+    # glue:CreateTable/DeleteTable on top of the read-only permissions this
+    # dashboard otherwise needs. Plain query + result-CSV parsing avoids that.
+    return wr.athena.read_sql_query(
+        sql, database=DATABASE, workgroup=WORKGROUP, s3_output=S3_OUTPUT, ctas_approach=False
+    )
 
 
 def kpi_summary() -> pd.DataFrame:

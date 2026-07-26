@@ -62,6 +62,7 @@ infra/aws/
   athena_ddl.sql                      registers the gold Delta tables in Athena/Glue Data Catalog
   eventbridge-glue-failure-rule.json  EventBridge pattern: Glue job failure -> SNS
   sns-topic-policy.json               reference SNS topic policy for CLI-created rules
+  dashboard-athena-glue-read-policy.json   IAM policy for the dashboard's Athena/Glue read access
 docs/production-run-log.md    FR8 7-consecutive-day run tracking template
 dashboard/
   app.py                       Streamlit app (architecture stage 6)
@@ -265,7 +266,15 @@ The AWS identity running it needs the same permissions as an Athena user
 querying these tables: `athena:StartQueryExecution`/`GetQueryExecution`/
 `GetQueryResults`, `glue:GetTable`/`GetDatabase`/`GetPartitions`,
 `s3:GetObject`/`ListBucket` on the curated bucket, and
-`s3:GetObject`/`PutObject` on the Athena query-results bucket.
+`s3:GetObject`/`PutObject` on the Athena query-results bucket. Nothing
+more - `queries.py` explicitly passes `ctas_approach=False` to
+`awswrangler`, since its default CTAS approach stages results through a
+temporary Glue table and needs `glue:CreateTable`/`DeleteTable` on top of
+this, which is unnecessary write access for a read-only dashboard.
+`infra/aws/dashboard-athena-glue-read-policy.json` is a ready-to-attach
+IAM policy covering exactly this (Athena query + Glue Catalog read); the
+S3 permissions above are typically already covered by whatever policy the
+IAM user already has for the pipeline's S3 buckets.
 
 I can't verify the rendered charts against real numbers in this sandbox
 (no AWS credentials here) — run it and confirm the KPIs/charts populate
